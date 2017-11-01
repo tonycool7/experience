@@ -1,0 +1,117 @@
+<?php
+
+namespace App\Http\Controllers\Wifihotspot;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use \PayPal\Api\VerifyWebhookSignature;
+use \PayPal\Api\WebhookEvent;
+use \PayPal\Api\BillingAgreementDetails;
+
+class APIController extends Controller
+{
+
+    public function ins(Request $request){
+        //$params = json_decode($request->getContent(),true);
+
+        //\Log::info("HEAD:",$request->header());
+        \Log::info("INS1:",[$request->getContent()]);
+
+        $apiContext = new \PayPal\Rest\ApiContext(
+            new \PayPal\Auth\OAuthTokenCredential(
+                env('PP_USER'),     // ClientID
+                env('PP_SECRET')      // ClientSecret
+            ));
+        $apiContext->setConfig(
+            array(
+                'mode' => env('PP_MODE'),
+                'http.ConnectionTimeOut' => 30,
+                'log.LogEnabled' => true,
+                'log.FileName' => '../storage/logs/PayPal.log',
+                'log.LogLevel' => 'FINE',
+                'validation.level' => 'log'
+            )
+        );
+        $headers = array_change_key_case($request->header(), CASE_UPPER);
+
+        $signatureVerification = new VerifyWebhookSignature();
+        $signatureVerification->setAuthAlgo($headers['PAYPAL-AUTH-ALGO'][0]);
+        $signatureVerification->setTransmissionId($headers['PAYPAL-TRANSMISSION-ID'][0]);
+        $signatureVerification->setCertUrl($headers['PAYPAL-CERT-URL'][0]);
+        $signatureVerification->setWebhookId(env("PP_WEBHOOK_ID")); // Note that the Webhook ID must be a currently valid Webhook that you created with your client ID/secret.
+        $signatureVerification->setTransmissionSig($headers['PAYPAL-TRANSMISSION-SIG'][0]);
+        $signatureVerification->setTransmissionTime($headers['PAYPAL-TRANSMISSION-TIME'][0]);
+        $signatureVerification->setRequestBody($request->getContent());
+
+        //$request = clone $signatureVerification;
+
+        try {
+            /** @var \PayPal\Api\VerifyWebhookSignatureResponse $output */
+            $output = $signatureVerification->post($apiContext);
+        } catch (Exception $ex) {
+            \Log::info("INS SIG VERIFICATION ERROR:",$ex);
+        }
+        \Log::info("INS SIG VERIFICATION:",array($output->getVerificationStatus()));
+
+        if ($output->getVerificationStatus() != 'SUCCESS'){
+            //	 exit;
+        }
+
+        switch($request->input('event_type')){
+            case 'PAYMENT.SALE.COMPLETED':
+                \Log::info("INS:",['state '.$request->input('resource.state'),'id '.$request->input('resource.id'),'agr '.$request->input('resource.billing_agreement_id')]);
+                $agreementID = $request->input('resource.billing_agreement_id');
+                $agreement_check = \PayPal\Api\Agreement::get($agreementID, $apiContext);
+                $agreement_details = $agreement_check->getAgreementDetails();
+                $renew_date = date('Y-m-d H:i:s', strtotime($agreement_details->getNextBillingDate()));
+                \Log::info("INS:",['NextBillingDate: '.$renew_date]);
+                $subscription = \App\Wifihotspot\Subscription::where('twoco_id',$agreementID)->first();
+                if(is_null($subscription)){
+                    \Log::info("INS:",['agrement not found: '.$request->input('resource.billing_agreement_id')]);
+                    \App\Wifihotspot\Log::create(['user_id'=> $subscription->user_id, 'userlist_id'=>0, 'ip' => $request->server->all()['REMOTE_ADDR'], 'action' => 'billing_payment', 'message' => 'Recurring payment was unsuccessful']);
+                    break;
+                }
+                \App\Wifihotspot\Log::create(['user_id'=> $subscription->user_id, 'userlist_id'=>0, 'ip' => $request->server->all()['REMOTE_ADDR'], 'action' => 'billing_payment', 'message' => 'Recurring payment was successful']);
+                $subscription->ends_at = $renew_date;
+                $subscription->save();
+                break;
+            case 'BILLING.SUBSCRIPTION.CREATED':
+                $agreementID = $request->input('resource.id');
+                $subscription = \App\Wifihotspot\Subscription::where('twoco_id',$agreementID)->first();
+                if(is_null($subscription)){
+                    \Log::info("INS:",['user '.$request->input('resource.payer.payer_info.email').' not found! exiting.']);
+                    \App\Wifihotspot\Log::create(['user_id'=> $subscription->user_id, 'userlist_id'=>0, 'ip' => $request->server->all()['REMOTE_ADDR'], 'action' => 'billing_subscription', 'message' => 'User '.$request->input('resource.payer.payer_info.email').' not found!']);
+                }
+                \Log::info("INS:",['state '.$request->input('resource.state'),'id '.$request->input('resource.id'),'ends at '.$request->input('resource.agreement_details.next_billing_date')]);
+                \App\Wifihotspot\Log::create(['user_id'=> $subscription->user_id, 'userlist_id'=>0, 'ip' => $request->server->all()['REMOTE_ADDR'], 'action' => 'billing_subscription', 'message' => 'Billing subscription successful']);
+
+                $renew_date = date('Y-m-d H:i:s', strtotime($request->input('resource.agreement_details.next_billing_date') . ' +29 hours'));
+                $subscription->update(['name'=>'Premium',
+                    'twoco_id'=>$agreementID],
+                    [  'ends_at'=>$renew_date, //need to add 1 day
+                        'status'=>$request->input('resource.state')]
+                );
+                break;
+            case 'BILLING.SUBSCRIPTION.CANCELLED':
+                $agreementID = $request->input('resource.id');
+                $subscription = \App\Wifihotspot\Subscription::where('twoco_id',$agreementID)->first();
+                if(is_null($subscription)){
+                    \Log::info("INS:",['agrement not found: '.$request->input('resource.billing_agreement_id')]);
+                    \App\Wifihotspot\Log::create(['user_id'=> $subscription->user_id, 'userlist_id'=>0, 'ip' => $request->server->all()['REMOTE_ADDR'], 'action' => 'billing_cancellation', 'message' => 'Billing subscription cancellation unsuccessful']);
+
+                    break;
+                }
+                $status = $request->input('resource.state');
+                $subscription->status = $status;
+                $subscription->save();
+                \App\Wifihotspot\Log::create(['user_id'=> $subscription->user_id, 'userlist_id'=>0, 'ip' => $request->server->all()['REMOTE_ADDR'], 'action' => 'billing_cancellation', 'message' => 'Billing subscription cancelled']);
+                break;
+
+            case 'RECURRING_STOPPED':
+                $subscription = $user->subscriptions()->where('twoco_id',$params['sale_id'])->update(['status'=>$params['item_rec_status_1']]);
+                break;
+        }
+
+    }
+
+}
